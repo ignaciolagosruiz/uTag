@@ -27,9 +27,26 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
+
+/**
+ *  The single lite mode MapView used for every static map render in this process.
+ *
+ *  Creating a MapView per render leaks even when it is destroyed: the Maps SDK keeps hold of the
+ *  views of every MapView it has created. With the map widget refreshing every few minutes, the
+ *  :service process reached ~20,000 Views and ~1.6 GB (mostly native, swapped out) after 3 days.
+ *  Reusing one MapView bounds that to a single map. Renders are serialised by [lock], since they
+ *  share the map's state.
+ */
+private object StaticMapView {
+    val lock = Mutex()
+    var mapView: MapView? = null
+    var map: GoogleMap? = null
+}
 
 /**
  *  Generates a Bitmap of a Google Map of a given [width]x[height], and with the given [markers].
@@ -47,25 +64,33 @@ suspend fun Context.generateGoogleMap(
     moveWatermark: Boolean = false,
     modifier: suspend GoogleMap.() -> Unit = {},
     markers: suspend GoogleMap.() -> List<MarkerOptions>
-): Bitmap? = withTimeout(5000L) {
-    withContext(Dispatchers.Main) {
-        val options = GoogleMapOptions().liteMode(true)
-        val mapView = MapView(this@generateGoogleMap, options)
-        try {
-            mapView.onCreate(null)
-            mapView.onResume()
-            mapView.getMap().run {
+): Bitmap? = StaticMapView.lock.withLock {
+    withTimeout(5000L) {
+        withContext(Dispatchers.Main) {
+            //Application context, since the MapView outlives whatever component asked for this render
+            val mapView = StaticMapView.mapView ?: MapView(
+                applicationContext, GoogleMapOptions().liteMode(true)
+            ).also {
+                it.onCreate(null)
+                it.onResume()
+                StaticMapView.mapView = it
+            }
+            val map = StaticMapView.map ?: mapView.getMap().also { StaticMapView.map = it }
+            map.run {
+                //Reset anything a previous render may have left on the shared map
+                clear()
+                mapType = GoogleMap.MAP_TYPE_NORMAL
+                setMapStyle(null)
                 setPadding(padding.left, padding.top, padding.right, padding.bottom)
                 mapView.layoutParams = ViewGroup.LayoutParams(width, height)
-                if(moveWatermark) {
-                    val watermark = mapView.findViewWithTag<View>("GoogleWatermark")
-                    watermark.updateLayoutParams<RelativeLayout.LayoutParams> {
-                        addRule(RelativeLayout.ALIGN_PARENT_BOTTOM, 0)
-                        addRule(RelativeLayout.ALIGN_PARENT_LEFT, 0)
-                        addRule(RelativeLayout.ALIGN_PARENT_START, 0)
-                        addRule(RelativeLayout.ALIGN_PARENT_TOP, RelativeLayout.TRUE)
-                        addRule(RelativeLayout.ALIGN_PARENT_END, RelativeLayout.TRUE)
-                    }
+                mapView.findViewWithTag<View>("GoogleWatermark")?.updateLayoutParams<RelativeLayout.LayoutParams> {
+                    val moved = if(moveWatermark) RelativeLayout.TRUE else 0
+                    val default = if(moveWatermark) 0 else RelativeLayout.TRUE
+                    addRule(RelativeLayout.ALIGN_PARENT_BOTTOM, default)
+                    addRule(RelativeLayout.ALIGN_PARENT_LEFT, default)
+                    addRule(RelativeLayout.ALIGN_PARENT_START, default)
+                    addRule(RelativeLayout.ALIGN_PARENT_TOP, moved)
+                    addRule(RelativeLayout.ALIGN_PARENT_END, moved)
                 }
                 mapView.measure(
                     MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
@@ -87,17 +112,8 @@ suspend fun Context.generateGoogleMap(
                     moveCamera(CameraUpdateFactory.zoomOut())
                 }
                 awaitReady()
-                generateSnapshot().also {
-                    clear()
-                }
+                generateSnapshot()
             }
-        } finally {
-            //Always tear the MapView down, including when withTimeout cancels while waiting for the
-            //map to load or snapshot. Otherwise every timed out render leaks the MapView, its views
-            //and its native renderer, and the service process grows for as long as it runs.
-            mapView.onPause()
-            mapView.removeAllViews()
-            mapView.onDestroy()
         }
     }
 }
